@@ -1,5 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import json
+import csv
+import io
+import time
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from app.db.database import get_db
 from app.models.domain import Credential, AuditLog, Examination, Institution
 from app.schemas.credential import CredentialCreate, CredentialResponse, CredentialVerificationRequest, CredentialVerificationResponse, CredentialRevokeRequest
@@ -37,11 +42,16 @@ def create_credential(request: CredentialCreate, db: Session = Depends(get_db)):
         student_reference=request.credential_data.student_reference,
         credential_type=request.credential_data.credential_type,
         document_hash=doc_hash,
+        credential_data_json=json.dumps(cred_dict),
         status="VALID"
     )
     db.add(new_cred)
-    db.commit()
-    db.refresh(new_cred)
+    try:
+        db.commit()
+        db.refresh(new_cred)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A credential with this exact data already exists (Duplicate Document Hash).")
 
     # 4. Register on Blockchain
     try:
@@ -58,7 +68,110 @@ def create_credential(request: CredentialCreate, db: Session = Depends(get_db)):
     db.add(AuditLog(action="CREATED", credential_id=new_cred.credential_id, details="Credential created and registered on-chain"))
     db.commit()
 
-    return new_cred
+    return CredentialResponse(
+        credential_id=new_cred.credential_id,
+        document_hash=new_cred.document_hash,
+        blockchain_tx_hash=new_cred.blockchain_tx_hash,
+        status=new_cred.status,
+        issued_at=new_cred.issued_at,
+        credential_data=request.credential_data
+    )
+
+@router.post("/bulk-issue")
+async def bulk_issue_credentials(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
+
+    contents = await file.read()
+    decoded = contents.decode("utf-8")
+    reader = csv.DictReader(io.StringIO(decoded))
+    
+    successful = []
+    failed = []
+    total = 0
+    
+    # Ensure dummy institution/exam exists for bulk (if not already)
+    inst = db.query(Institution).first()
+    if not inst:
+        inst = Institution(name="Demo Institution")
+        db.add(inst)
+        db.commit()
+    exam = db.query(Examination).first()
+    if not exam:
+        exam = Examination(institution_id=inst.id, name="Demo Exam")
+        db.add(exam)
+        db.commit()
+
+    for row in reader:
+        total += 1
+        try:
+            from app.schemas.credential import CredentialData
+            
+            # Map CSV headers to schema
+            cred_data = CredentialData(
+                student_reference=row.get("Student Reference", ""),
+                examination_id=row.get("Examination ID", ""),
+                credential_type=row.get("Credential Type", ""),
+                institution_name=row.get("Institution Name", ""),
+                grade=row.get("Grade", ""),
+                issue_date=row.get("Issue Date", "")
+            )
+            
+            cred_id = f"CERT-{int(time.time() * 1000)}-{total}"
+            
+            # 1. Check duplicate ID
+            if db.query(Credential).filter(Credential.credential_id == cred_id).first():
+                failed.append({"row": total, "reason": "Credential ID collision"})
+                continue
+                
+            # 2. Canonicalize & Hash
+            cred_dict = cred_data.model_dump()
+            doc_hash = generate_credential_hash(cred_dict)
+            
+            # 3. Save to DB
+            new_cred = Credential(
+                credential_id=cred_id,
+                examination_id=exam.id,
+                student_reference=cred_data.student_reference,
+                credential_type=cred_data.credential_type,
+                document_hash=doc_hash,
+                credential_data_json=json.dumps(cred_dict),
+                status="VALID"
+            )
+            db.add(new_cred)
+            try:
+                db.commit()
+                db.refresh(new_cred)
+            except IntegrityError:
+                db.rollback()
+                failed.append({"row": total, "student_reference": cred_data.student_reference, "reason": "Duplicate Document Hash"})
+                continue
+                
+            # 4. Register on Blockchain
+            try:
+                tx_hash = blockchain_service.register_credential_hash(doc_hash, new_cred.credential_id)
+                new_cred.blockchain_tx_hash = tx_hash
+                db.commit()
+            except Exception as e:
+                db.delete(new_cred)
+                db.commit()
+                failed.append({"row": total, "student_reference": cred_data.student_reference, "reason": f"Blockchain failure: {str(e)}"})
+                continue
+                
+            db.add(AuditLog(action="CREATED", credential_id=cred_id, details="Bulk credential created and registered on-chain"))
+            db.commit()
+            
+            successful.append({"credential_id": cred_id, "student_reference": cred_data.student_reference})
+            
+        except Exception as e:
+            db.rollback()
+            failed.append({"row": total, "reason": str(e)})
+
+    return {
+        "total_processed": total,
+        "successful": successful,
+        "failed": failed
+    }
 
 @router.post("/verify", response_model=CredentialVerificationResponse)
 def verify_credential(request: CredentialVerificationRequest, db: Session = Depends(get_db)):
@@ -128,4 +241,16 @@ def get_credential(credential_id: str, db: Session = Depends(get_db)):
     db_cred = db.query(Credential).filter(Credential.credential_id == credential_id).first()
     if not db_cred:
         raise HTTPException(status_code=404, detail="Credential not found")
-    return db_cred
+        
+    cred_data = None
+    if db_cred.credential_data_json:
+        cred_data = json.loads(db_cred.credential_data_json)
+        
+    return CredentialResponse(
+        credential_id=db_cred.credential_id,
+        document_hash=db_cred.document_hash,
+        blockchain_tx_hash=db_cred.blockchain_tx_hash,
+        status=db_cred.status,
+        issued_at=db_cred.issued_at,
+        credential_data=cred_data
+    )
